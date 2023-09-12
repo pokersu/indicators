@@ -2,8 +2,9 @@ import warnings
 import numpy as np
 import pandas as pd
 import math
+from . import kernel
 from typing import List
-from indicators import cci, wma, sma, rsi
+from .indicators import cci, wma, sma, rsi, typical_price
 from pandas.core.base import PandasObject
 
 warnings.simplefilter(action="ignore", category=RuntimeWarning)
@@ -13,27 +14,33 @@ def nz(series, nan: np.float64 = np.float64(0.)):
     return series.replace(np.nan, nan)
 
 
-def normalize(series, min_val: np.float64, max_val: np.float64):
+def normalize(series: pd.Series, min_val: np.float64, max_val: np.float64):
     _historic_min = np.float64(10e10)
     _historic_max = np.float64(-10e10)
 
-    _historic_min = min(nz(series, nan=_historic_min), _historic_min)
-    _historic_max = max(nz(series, nan=_historic_max), _historic_max)
-    return min_val + (max_val - min_val) * (series - _historic_min) / max(_historic_max - _historic_min,
-                                                                          np.float64(10e-10))
+    def k(val):
+        nonlocal _historic_min, _historic_max
+        _historic_min = _historic_min if pd.isna(val) else min(val, _historic_min)
+        _historic_max = _historic_max if pd.isna(val) else max(val, _historic_max)
+        _distance = _historic_max - _historic_min
+        return min_val + (max_val - min_val) * (val - _historic_min) / max(_distance, np.float64(10e-10))
+
+    return series.apply(k)
 
 
 def rescale(series, old_min: np.float64, old_max: np.float64, new_min: np.float64, new_max: np.float64):
-    new_min + (new_max - new_min) * (series - old_min) / max(old_max - old_min, 10e-10)
+    return new_min + (new_max - new_min) * (series - old_min) / max(old_max - old_min, 10e-10)
 
 
-def n_cci(series, cci_window: int, ema_window: int):
-    series = cci(series, cci_window)
+def n_cci(bars: pd.DataFrame, cci_window: int = 20, ema_window: int = 1):
+    # todo: 这里与 trading view 中 ta.cci 计算方式不一样
+    series = cci(bars, cci_window)
     series = wma(series, ema_window)
-    return normalize(series, np.float64(0.), np.float64(100.))
+    return normalize(series, np.float64(0.), np.float64(1.))
 
 
-def n_wt(series, ema_window_1: int, ema_window_2: int):
+def n_wt(bars: pd.DataFrame, ema_window_1: int = 10, ema_window_2: int = 11):
+    series = typical_price(bars)
     ema1 = wma(series, ema_window_1)
     ema2 = wma(pd.Series(series - ema1).abs(), ema_window_1)
     ci = (series - ema1) / (0.015 * ema2)
@@ -42,77 +49,77 @@ def n_wt(series, ema_window_1: int, ema_window_2: int):
     return normalize(wt1 - wt2, np.float64(0.), np.float64(1.))
 
 
-def n_rsi(series, rsi_window: int, ema_window: int):
+def n_rsi(bars: pd.DataFrame, rsi_window: int = 14, ema_window: int = 1):
+    series = bars['close']
     series = rsi(series, rsi_window)
     series = wma(series, ema_window)
     return rescale(series, np.float64(0.), np.float64(100.), np.float64(0.), np.float64(1.))
 
 
-def n_adx(bars: pd.DataFrame, length: int):
-    tr_smooth = pd.Series([0.0] * bars.size)
-    smooth_direct_movement = pd.Series([0.0] * bars.size)
-    smooth_neg_movement = pd.Series([0.0] * bars.size)
-    dxs = pd.Series([0.0] * bars.size)
+def s_adx(data: pd.DataFrame, length: int):
+    bars = data.copy(deep=True)
+    bars['tr_smooth'], bars['smooth_direct_movement'], bars['smooth_neg_movement'], bars['dxs'] = 0., 0., 0., 0.
+    bars.index = range(len(bars))
+    cols = bars.columns
     alpha = 1. / length
 
-    def _nz(x: float):
-        return 0. if x == np.nan else x
+    def conv(x):
+        pre_idx, idx = x.index
+        pre_row, row = bars.iloc[pre_idx], bars.iloc[idx]
+        tr = max(max(row['high'] - row['low'], abs(row['high'] - pre_row['close'])), abs(row['low'] - pre_row['close']))
+        directional_movement_plus = max(row['high'] - pre_row['high'], 0.) if row['high'] - pre_row['high'] > pre_row[
+            'low'] - row['low'] else 0
+        neg_movement = max(pre_row['low'] - row['low'], 0.) if pre_row['low'] - row['low'] > row['high'] - pre_row[
+            'high'] else 0.
+        tr_smooth_val = pre_row['tr_smooth'] - pre_row['tr_smooth'] / length + tr
+        smooth_direct_movement_val = pre_row['smooth_direct_movement'] - pre_row[
+            'smooth_direct_movement'] / length + directional_movement_plus
+        smooth_neg_movement_val = pre_row['smooth_neg_movement'] - pre_row[
+            'smooth_neg_movement'] / length + neg_movement
+        bars.iat[idx, cols.get_loc('tr_smooth')] = tr_smooth_val
+        bars.iat[idx, cols.get_loc('smooth_direct_movement')] = smooth_direct_movement_val
+        bars.iat[idx, cols.get_loc('smooth_neg_movement')] = smooth_neg_movement_val
 
-    def k(row):
-        idx = row.name
-        pre_idx = idx - 1
-        high, low, close = row['high'], row['low'], row['close']
-        pre_high, pre_low = bars.iloc[pre_idx]['high'], bars.iloc[pre_idx]['low']
-        pre_close, pre_tr_smooth = bars.iloc[pre_idx]['close'], tr_smooth[pre_idx]
-        pre_smooth_directional_movement_plus = smooth_direct_movement[pre_idx]
-        pre_tr_smooth_neg_movement = smooth_neg_movement[pre_idx]
-        pre_dx = dxs[pre_idx]
-        pre_high, pre_low, pre_close = _nz(pre_high), _nz(pre_low), _nz(pre_close)
-        pre_tr_smooth = _nz(pre_tr_smooth)
-        pre_smooth_directional_movement_plus = _nz(pre_smooth_directional_movement_plus)
-        pre_tr_smooth_neg_movement = _nz(pre_tr_smooth_neg_movement)
-        tr = max(max(high - low, abs(high - pre_close)), abs(low - pre_close))
-        directional_movement_plus = max(high - pre_high, 0.) if high - pre_high > pre_low - low else 0
-        neg_movement = max(pre_low - low, 0.) if pre_low - low > high - pre_high else 0.
-        tr_smooth[idx] = pre_tr_smooth - pre_tr_smooth / length + tr
-        smooth_direct_movement[
-            idx] = pre_smooth_directional_movement_plus - pre_smooth_directional_movement_plus / length + directional_movement_plus
-        smooth_neg_movement[idx] = pre_tr_smooth_neg_movement - pre_tr_smooth_neg_movement / length + neg_movement
-        di_positive = smooth_direct_movement[idx] / tr_smooth[idx] * 100.
-        di_negative = smooth_neg_movement[idx] / tr_smooth[idx] * 100.
+        di_positive = smooth_direct_movement_val / tr_smooth_val * 100.
+        di_negative = smooth_neg_movement_val / tr_smooth_val * 100.
         dx = abs(di_positive - di_negative) / (di_positive + di_negative) * 100.
-        return dx * alpha + (1. - alpha) * pre_dx
+        _adx = alpha * dx + (1. - alpha) * pre_row['dxs']
+        bars.iat[idx, cols.get_loc('dxs')] = _adx
+        return _adx
 
-    adx = bars.apply(k, axis=1)
+    adx = bars['open'].rolling(2).apply(conv)
+    adx.index = data.index
+    return adx
+
+
+def n_adx(data: pd.DataFrame, length: int):
+    adx = s_adx(data, length)
     return rescale(adx, np.float64(0.), np.float64(100.), np.float64(0.), np.float64(1.))
 
 
-def normalized_slope_decline(bars: pd.DataFrame):
-    value1 = pd.Series([0.0] * bars.size)
-    value2 = pd.Series([0.0] * bars.size)
-    klmf = pd.Series([0.0] * bars.size)
+def regime(data: pd.DataFrame):
+    bars = data.copy(deep=True)
+    bars['ohlc4'] = (bars['open'] + bars['high'] + bars['low'] + bars['close']) / 4.
+    bars['value1'], bars['value2'], bars['klmf'] = 0., 0., 0.
+    bars.index = range(len(bars))
+    cols = bars.columns
 
-    def _nz(x: float):
-        return 0. if x == np.nan else x
-
-    def k(row):
-        idx = row.name
-        pre_idx = idx - 1
-        high, low, close = row['high'], row['low'], row['close']
-        pre_high, pre_low = bars.iloc[pre_idx]['high'], bars.iloc[pre_idx]['low']
-        pre_close = bars.iloc[pre_idx]['close']
-        pre_klmf = klmf[pre_idx]
-        pre_high, pre_low, pre_close = _nz(pre_high), _nz(pre_low), _nz(pre_close)
-        pre_value1, pre_value2 = value1[pre_idx], value2[pre_idx]
-        value1[idx] = 0.2 * (close - pre_close) + 0.8 * _nz(pre_value1)
-        value2[idx] = 0.1 * (high - low) + 0.8 * _nz(pre_value2)
-        omega = abs(value1[idx] / value2[idx])
+    def conv(x):
+        pre_idx, idx = x.index
+        pre_row, row = bars.iloc[pre_idx], bars.iloc[idx]
+        val1 = 0.2 * (row['ohlc4'] - pre_row['ohlc4']) + 0.8 * pre_row['value1']
+        val2 = 0.1 * (row['high'] - row['low']) + 0.8 * pre_row['value2']
+        bars.iat[idx, cols.get_loc('value1')] = val1
+        bars.iat[idx, cols.get_loc('value2')] = val2
+        omega = abs(val1 / val2)
         alpha = (-math.pow(omega, 2) + math.sqrt(math.pow(omega, 4) + 16 * math.pow(omega, 2))) / 8
-        klmf[idx] = alpha * close + (1 - alpha) * pre_klmf
-        abs_curve_slope = abs(klmf[idx] - pre_klmf)
+        klmf = alpha * row['ohlc4'] + (1 - alpha) * pre_row['klmf']
+        bars.iat[idx, cols.get_loc('klmf')] = klmf
+        abs_curve_slope = abs(klmf - pre_row['klmf'])
         return abs_curve_slope
 
-    abs_curve_slope_series = bars.apply(k, axis=1)
+    abs_curve_slope_series = bars['open'].rolling(2).apply(conv)
+    abs_curve_slope_series.index = data.index
     exponential_average_abs_curve_slope = wma(abs_curve_slope_series, 200) * 1.0
     return (abs_curve_slope_series - exponential_average_abs_curve_slope) / exponential_average_abs_curve_slope
 
@@ -122,6 +129,39 @@ def distance(bars: pd.DataFrame, row: pd.Series, features: List[str]):
     point = row[features].values.astype(np.float64)
     return np.sum(np.log(1 + np.abs(points - point)), axis=1)
 
+
+def rational_quadratic(bars: pd.DataFrame, _lookback: int, _relative_weight: float, start_at_bar: int):
+    idx = 0
+    series = bars['close']
+
+    def k(_):
+        nonlocal idx
+        if idx <= 25:
+            idx = idx + 1
+            return np.nan
+        data = series[:idx + 1]
+        idx = idx + 1
+        return kernel.rational_quadratic(data, _lookback, _relative_weight, start_at_bar)
+
+    return series.apply(k)
+
+
+def gaussian(bars: pd.DataFrame, _lookback: int, start_at_bar: int):
+    idx = 0
+    series = bars['close']
+
+    def k(_):
+        nonlocal idx
+        if idx <= 25:
+            idx = idx + 1
+            return np.nan
+        data = series[:idx + 1]
+        idx = idx + 1
+        return kernel.gaussian(data, _lookback, start_at_bar)
+
+    return series.apply(k)
+
+
 PandasObject.nz = nz
 PandasObject.distance = distance
 PandasObject.normalize = normalize
@@ -130,4 +170,7 @@ PandasObject.n_cci = n_cci
 PandasObject.n_wt = n_wt
 PandasObject.n_rsi = n_rsi
 PandasObject.n_adx = n_adx
-PandasObject.normalized_slope_decline = normalized_slope_decline
+PandasObject.s_adx = s_adx
+PandasObject.regime = regime
+PandasObject.rational_quadratic = rational_quadratic
+PandasObject.gaussian = gaussian
