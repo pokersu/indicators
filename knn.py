@@ -124,6 +124,17 @@ def regime(data: pd.DataFrame):
     return (abs_curve_slope_series - exponential_average_abs_curve_slope) / exponential_average_abs_curve_slope
 
 
+def trend(bars: pd.DataFrame):
+    def conv(c):
+        c4, c0 = c[0], c[3]
+        if c4 < c0:
+            return -1
+        elif c4 > c0:
+            return 1
+        else:
+            return 0
+    return bars['close'].rolling(window=4).apply(conv)
+
 def distance(bars: pd.DataFrame, row: pd.Series, features: List[str]):
     points = bars[features].values.astype(np.float64)
     point = row[features].values.astype(np.float64)
@@ -171,6 +182,7 @@ PandasObject.n_wt = n_wt
 PandasObject.n_rsi = n_rsi
 PandasObject.n_adx = n_adx
 PandasObject.s_adx = s_adx
+PandasObject.trend = trend
 PandasObject.regime = regime
 PandasObject.rational_quadratic = rational_quadratic
 PandasObject.gaussian = gaussian
