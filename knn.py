@@ -124,7 +124,9 @@ def regime(data: pd.DataFrame):
     return (abs_curve_slope_series - exponential_average_abs_curve_slope) / exponential_average_abs_curve_slope
 
 
-def trend(bars: pd.DataFrame):
+def train_labeling(bars: pd.DataFrame, features: list[str]):
+    data_len = len(bars)
+
     def conv(c):
         c4, c0 = c[0], c[3]
         if c4 < c0:
@@ -133,12 +135,42 @@ def trend(bars: pd.DataFrame):
             return 1
         else:
             return 0
-    return bars['close'].rolling(window=4).apply(conv)
 
-def distance(bars: pd.DataFrame, row: pd.Series, features: List[str]):
-    points = bars[features].values.astype(np.float64)
-    point = row[features].values.astype(np.float64)
-    return np.sum(np.log(1 + np.abs(points - point)), axis=1)
+    def label(row):
+        index = row.name
+        historic = bars[:index].iloc[:-1]
+        his_data_len = len(historic)
+        if his_data_len < 3000 or data_len - his_data_len > 300:
+            return np.nan
+
+        point = row[features].values.astype(np.float64)
+        points = historic[features].values.astype(np.float64)
+        distance_series = pd.Series(np.sum(np.log(1 + np.abs(points - point)), axis=1), index=historic.index)
+
+        last_distance = -1.0
+        distances = []
+        predictions = []
+        c = 0
+        for index, d in distance_series.items():
+            if d >= last_distance and c % 4 == 0:
+                last_distance = d
+                distances.append(d)
+                predictions.append(historic.loc[index]['trend'])
+                if len(distances) >= 8:
+                    last_distance = distance_series[6]
+                    distances.pop(0)
+                    predictions.pop(0)
+            c += 1
+        return sum(predictions)
+
+    bars['trend'] = bars['close'].rolling(window=4).apply(conv)
+    return bars.apply(label, axis=1)
+
+
+# def distance(bars: pd.DataFrame, row: pd.Series, features: List[str]):
+#     points = bars[features].values.astype(np.float64)
+#     point = row[features].values.astype(np.float64)
+#     return np.sum(np.log(1 + np.abs(points - point)), axis=1)
 
 
 def rational_quadratic(bars: pd.DataFrame, _lookback: int, _relative_weight: float, start_at_bar: int):
@@ -174,7 +206,7 @@ def gaussian(bars: pd.DataFrame, _lookback: int, start_at_bar: int):
 
 
 PandasObject.nz = nz
-PandasObject.distance = distance
+# PandasObject.distance = distance
 PandasObject.normalize = normalize
 PandasObject.rescale = rescale
 PandasObject.n_cci = n_cci
@@ -182,7 +214,7 @@ PandasObject.n_wt = n_wt
 PandasObject.n_rsi = n_rsi
 PandasObject.n_adx = n_adx
 PandasObject.s_adx = s_adx
-PandasObject.trend = trend
+PandasObject.train_labeling = train_labeling
 PandasObject.regime = regime
 PandasObject.rational_quadratic = rational_quadratic
 PandasObject.gaussian = gaussian
