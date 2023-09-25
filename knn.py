@@ -15,17 +15,12 @@ def nz(series, nan: np.float64 = np.float64(0.)):
 
 
 def normalize(series: pd.Series, min_val: np.float64, max_val: np.float64):
-    _historic_min = np.float64(10e10)
-    _historic_max = np.float64(-10e10)
-
-    def k(val):
-        nonlocal _historic_min, _historic_max
-        _historic_min = _historic_min if pd.isna(val) else min(val, _historic_min)
-        _historic_max = _historic_max if pd.isna(val) else max(val, _historic_max)
-        _distance = _historic_max - _historic_min
-        return min_val + (max_val - min_val) * (val - _historic_min) / max(_distance, np.float64(10e-10))
-
-    return series.apply(k)
+    max_values = series.expanding().max()
+    min_values = series.expanding().min()
+    distances = max_values - min_values
+    distances = distances.apply(lambda d: max(d, np.float64(10e-10)))
+    calc_df = pd.concat([series, min_values, distances], axis=1)
+    return min_val + (max_val - min_val) * (calc_df[0] - calc_df[1]) / calc_df[2]
 
 
 def rescale(series, old_min: np.float64, old_max: np.float64, new_min: np.float64, new_max: np.float64):
@@ -33,8 +28,21 @@ def rescale(series, old_min: np.float64, old_max: np.float64, new_min: np.float6
 
 
 def n_cci(bars: pd.DataFrame, cci_window: int = 20, ema_window: int = 1):
-    # todo: 这里与 trading view 中 ta.cci 计算方式不一样
-    series = cci(bars, cci_window)
+    price = bars['close']
+    ma = sma(price, cci_window)
+    calc_s = pd.concat([price, ma], axis=1, keys=['p', 'm'])
+
+    def k(row):
+        idx = row.name
+        historic_df = calc_s[:idx]
+        if len(historic_df) <= cci_window:
+            return np.nan
+        temp_df = historic_df[-cci_window:]
+        mean = temp_df['m'][-1]
+        return sum(abs(temp_df['p'] - mean)) / cci_window
+
+    md = calc_s.apply(k, axis=1)
+    series = (price - ma) / (.015 * md)
     series = wma(series, ema_window)
     return normalize(series, np.float64(0.), np.float64(1.))
 
@@ -125,10 +133,8 @@ def regime(data: pd.DataFrame):
 
 
 def train_labeling(bars: pd.DataFrame, features: list[str]):
-    data_len = len(bars)
-
     def conv(c):
-        c4, c0 = c[0], c[3]
+        c4, c0 = c[0], c[4]
         if c4 < c0:
             return -1
         elif c4 > c0:
@@ -136,41 +142,31 @@ def train_labeling(bars: pd.DataFrame, features: list[str]):
         else:
             return 0
 
-    def label(row):
-        index = row.name
-        historic = bars[:index].iloc[:-1]
-        his_data_len = len(historic)
-        if his_data_len < 3000 or data_len - his_data_len > 300:
-            return np.nan
+    distances = []
+    predictions = []
 
-        point = row[features].values.astype(np.float64)
-        points = historic[features].values.astype(np.float64)
-        distance_series = pd.Series(np.sum(np.log(1 + np.abs(points - point)), axis=1), index=historic.index)
-
+    def distance_conv(window):
+        idx = window.index
+        rows = bars.loc[idx]
+        point = rows.iloc[-1][features].values.astype(np.float64)
+        points = rows[features].values.astype(np.float64)
+        distances_series = pd.Series(np.sum(np.log(1 + np.abs(points - point)), axis=1), index=idx)
+        # distances_series = distances_series.iloc[:2000]
         last_distance = -1.0
-        distances = []
-        predictions = []
-        c = 0
-        for index, d in distance_series.items():
-            if d >= last_distance and c % 4 == 0:
+
+        for i, (index, d) in enumerate(distances_series.items()):
+            if d >= last_distance and i % 4 == 0:
                 last_distance = d
                 distances.append(d)
-                predictions.append(historic.loc[index]['trend'])
-                if len(distances) >= 8:
-                    last_distance = distance_series[6]
+                predictions.append(rows.loc[index]['trend'])
+                if len(predictions) > 8:
+                    last_distance = distances[6]
                     distances.pop(0)
                     predictions.pop(0)
-            c += 1
         return sum(predictions)
 
-    bars['trend'] = bars['close'].rolling(window=4).apply(conv)
-    return bars.apply(label, axis=1)
-
-
-# def distance(bars: pd.DataFrame, row: pd.Series, features: List[str]):
-#     points = bars[features].values.astype(np.float64)
-#     point = row[features].values.astype(np.float64)
-#     return np.sum(np.log(1 + np.abs(points - point)), axis=1)
+    bars['trend'] = bars['close'].rolling(window=5).apply(conv)
+    return bars['close'].rolling(window=2000).apply(distance_conv)
 
 
 def rational_quadratic(bars: pd.DataFrame, _lookback: int, _relative_weight: float, start_at_bar: int):
@@ -205,8 +201,70 @@ def gaussian(bars: pd.DataFrame, _lookback: int, start_at_bar: int):
     return series.apply(k)
 
 
+def render_signal(bars: pd.DataFrame):
+    def k(row):
+        if row['train_label'] > 0 and row['filter_all']:
+            return 1
+        elif row['train_label'] < 0 and row['filter_all']:
+            return -1
+        else:
+            return np.nan
+
+    signals = bars.apply(k, axis=1)
+    return signals.fillna(method='ffill')
+
+
+def render_signal_held(bars: pd.DataFrame):
+    series = bars['signal']
+    return series.groupby(series.ne(series.shift()).cumsum()).cumcount() + 1
+
+
+def render_signal_flip(bars: pd.DataFrame):
+    signals = bars['signal']
+    s_shift = signals.shift(1)
+    return s_shift != signals
+
+
+def render_ema_trend(bars: pd.DataFrame, ema_window: int):
+    ema_s = wma(bars['close'], ema_window)
+    return pd.Series(np.where(bars['close'] > ema_s, 1, np.where(bars['close'] < ema_s, -1, 0)), index=bars.index)
+
+
+def render_sma_trend(bars: pd.DataFrame, sma_window: int):
+    sma_s = sma(bars['close'], sma_window)
+    return pd.Series(np.where(bars['close'] > sma_s, 1, np.where(bars['close'] < sma_s, -1, 0)), index=bars.index)
+
+
+def render_kernel_trend(bars: pd.DataFrame, smooth=False):
+    if smooth:
+        return pd.Series(np.where(bars['yhat2'] >= bars['yhat1'], 1, -1), index=bars.index)
+    else:
+        s = bars['yhat1']
+        s_ = s.shift(1)
+        return (s > s_).astype(int) - (s < s_).astype(int)
+
+
+def render_long(bars: pd.DataFrame):
+    condition = np.where((bars['signal'] > 0)
+                         & (bars['signal_flip'])
+                         & (bars['ema_trend'] > 0)
+                         & (bars['sma_trend'] > 0)
+                         & (bars['kernel_trend'] > 0), True, False)
+    # condition = np.where((bars['signal'] > 0), True, False)
+    return pd.Series(condition, index=bars.index)
+
+
+def render_short(bars: pd.DataFrame):
+    condition = np.where((bars['signal'] < 0)
+                         & (bars['signal_flip'])
+                         & (bars['ema_trend'] < 0)
+                         & (bars['sma_trend'] < 0)
+                         & (bars['kernel_trend'] < 0), True, False)
+    # condition = np.where((bars['signal'] < 0), True, False)
+    return pd.Series(condition, index=bars.index)
+
+
 PandasObject.nz = nz
-# PandasObject.distance = distance
 PandasObject.normalize = normalize
 PandasObject.rescale = rescale
 PandasObject.n_cci = n_cci
@@ -218,3 +276,11 @@ PandasObject.train_labeling = train_labeling
 PandasObject.regime = regime
 PandasObject.rational_quadratic = rational_quadratic
 PandasObject.gaussian = gaussian
+PandasObject.render_signal = render_signal
+PandasObject.render_signal_held = render_signal_held
+PandasObject.render_signal_flip = render_signal_flip
+PandasObject.render_ema_trend = render_ema_trend
+PandasObject.render_sma_trend = render_sma_trend
+PandasObject.render_kernel_trend = render_kernel_trend
+PandasObject.render_long = render_long
+PandasObject.render_short = render_short
